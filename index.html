@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>Darkroom Timer</title>
+
+    <link rel="manifest" href="manifest.json" />
+    <meta name="theme-color" content="#050000" />
+    <link rel="icon" type="image/svg+xml" href="icon.svg" />
+
+    <style>
+      /* Dark red theme for minimal glare */
+      :root {
+        --bg-color: #050000;
+        --main-color: #aa0000;
+        --dim-color: #330000;
+      }
+
+      * {
+        box-sizing: border-box;
+        user-select: none;
+        -webkit-user-select: none;
+        touch-action: manipulation; /* Prevents zooming when double-tapping */
+      }
+
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: var(--bg-color);
+        color: var(--main-color);
+        font-family: "Courier New", Courier, monospace;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .container {
+        position: relative;
+        width: 300px;
+        height: 300px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+      }
+
+      /* SVG Circle */
+      svg {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        transform: rotate(-90deg);
+      }
+
+      circle {
+        fill: none;
+        stroke-width: 4;
+        stroke-linecap: round;
+      }
+
+      .track {
+        stroke: var(--dim-color);
+      }
+      .progress {
+        stroke: var(--main-color);
+        stroke-dasharray: 283; /* 2 * PI * r (r=45) */
+        stroke-dashoffset: 0;
+        transition: stroke-dashoffset 0.1s linear;
+      }
+
+      /* Time inside a circle */
+      .time-display {
+        font-size: 3.5rem;
+        font-weight: bold;
+        z-index: 10;
+      }
+
+      /* Controls (hidden during operation) */
+      .controls {
+        margin-top: 30px;
+        display: flex;
+        gap: 10px;
+        z-index: 10;
+        transition: opacity 0.3s;
+      }
+
+      input {
+        background: var(--bg-color);
+        color: var(--main-color);
+        border: 1px solid var(--dim-color);
+        border-radius: 5px;
+        font-size: 1.5rem;
+        width: 60px;
+        text-align: center;
+        font-family: inherit;
+      }
+
+      input:focus {
+        outline: none;
+        border-color: var(--main-color);
+      }
+
+      button {
+        background: var(--dim-color);
+        color: var(--main-color);
+        border: 1px solid var(--main-color);
+        padding: 10px 20px;
+        font-size: 1.2rem;
+        border-radius: 5px;
+        cursor: pointer;
+        font-family: inherit;
+        text-transform: uppercase;
+      }
+
+      button:active {
+        background: var(--main-color);
+        color: var(--bg-color);
+      }
+
+      .hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      /* Invisible overlay for tap reset */
+      #tap-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        z-index: 100;
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <svg viewBox="0 0 100 100">
+        <circle class="track" cx="50" cy="50" r="45"></circle>
+        <circle
+          class="progress"
+          cx="50"
+          cy="50"
+          r="45"
+          id="progress-circle"
+        ></circle>
+      </svg>
+      <div class="time-display" id="time-display">00:00</div>
+    </div>
+
+    <div class="controls" id="controls">
+      <input
+        type="number"
+        id="input-min"
+        min="0"
+        max="59"
+        value="0"
+        placeholder="ММ"
+      />
+      <input
+        type="number"
+        id="input-sec"
+        min="0"
+        max="59"
+        value="15"
+        placeholder="СС"
+      />
+      <button id="start-btn">Start</button>
+    </div>
+
+    <div id="tap-overlay"></div>
+
+    <script>
+      // Timer logic and UI
+      const display = document.getElementById("time-display");
+      const minInput = document.getElementById("input-min");
+      const secInput = document.getElementById("input-sec");
+      const startBtn = document.getElementById("start-btn");
+      const controls = document.getElementById("controls");
+      const progressCircle = document.getElementById("progress-circle");
+      const tapOverlay = document.getElementById("tap-overlay");
+
+      let audioCtx;
+      let wakeLock = null;
+      let timerInterval;
+      let totalMs = 0;
+      let endTime = 0;
+      let isRunning = false;
+      let lastTickSec = -1;
+
+      const CIRCUMFERENCE = 282.74; // 2 * pi * 45
+
+      // Initializing the Web Audio API for a Metronome (Generating Sound on the Fly)
+      function initAudio() {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume();
+        }
+      }
+
+      function playTick(isFinish = false) {
+        if (!audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        const t = audioCtx.currentTime;
+
+        if (isFinish) {
+          // Long beep at the end
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(600, t);
+          gain.gain.setValueAtTime(1, t);
+          gain.gain.exponentialRampToValueAtTime(0.01, t + 1);
+          osc.start(t);
+          osc.stop(t + 1);
+        } else {
+          // A short click of the metronome
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(400, t);
+          osc.frequency.exponentialRampToValueAtTime(50, t + 0.05);
+          gain.gain.setValueAtTime(1, t);
+          gain.gain.exponentialRampToValueAtTime(0.01, t + 0.05);
+          osc.start(t);
+          osc.stop(t + 0.05);
+        }
+      }
+
+      // Blocking the screen from going to sleep
+      async function requestWakeLock() {
+        try {
+          if ("wakeLock" in navigator) {
+            wakeLock = await navigator.wakeLock.request("screen");
+          }
+        } catch (err) {
+          console.log("Wake Lock API is not supported or blocked:", err);
+        }
+      }
+
+      function releaseWakeLock() {
+        if (wakeLock !== null) {
+          wakeLock.release().then(() => (wakeLock = null));
+        }
+      }
+
+      function updateDisplay(ms) {
+        const totalSec = Math.ceil(ms / 1000);
+        const m = Math.floor(totalSec / 60)
+          .toString()
+          .padStart(2, "0");
+        const s = (totalSec % 60).toString().padStart(2, "0");
+        display.textContent = `${m}:${s}`;
+
+        // Circle update
+        const progress = ms / totalMs;
+        const offset = CIRCUMFERENCE - progress * CIRCUMFERENCE;
+        progressCircle.style.strokeDashoffset = isNaN(offset) ? 0 : offset;
+      }
+
+      function stopTimer() {
+        isRunning = false;
+        clearInterval(timerInterval);
+        controls.classList.remove("hidden");
+        tapOverlay.style.display = "none";
+        releaseWakeLock();
+        progressCircle.style.strokeDashoffset = 0;
+
+        // Exit full-screen mode
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        }
+      }
+
+      function resetToZero() {
+        display.textContent = "00:00";
+        progressCircle.style.strokeDashoffset = CIRCUMFERENCE;
+        minInput.value = 0;
+        secInput.value = 0;
+      }
+
+      function startTimer(e) {
+        e.stopPropagation(); // To prevent the click from going to the body
+
+        let m = parseInt(minInput.value) || 0;
+        let s = parseInt(secInput.value) || 0;
+        totalMs = (m * 60 + s) * 1000;
+
+        if (totalMs <= 0) return;
+
+        initAudio(); // Activate the sound on user click
+        requestWakeLock();
+
+        // Switch to full screen mode for maximum dimming
+        if (document.documentElement.requestFullscreen) {
+          document.documentElement.requestFullscreen().catch(() => {});
+        }
+
+        isRunning = true;
+        endTime = Date.now() + totalMs;
+        lastTickSec = Math.ceil(totalMs / 1000);
+
+        controls.classList.add("hidden");
+        tapOverlay.style.display = "block";
+
+        updateDisplay(totalMs);
+        playTick(); // The first tick immediately
+
+        timerInterval = setInterval(() => {
+          const remaining = endTime - Date.now();
+
+          if (remaining <= 0) {
+            updateDisplay(0);
+            playTick(true); // Finish sound
+            stopTimer();
+            return;
+          }
+
+          updateDisplay(remaining);
+
+          const currentSec = Math.ceil(remaining / 1000);
+          if (currentSec !== lastTickSec) {
+            playTick(); // The metronome ticks every second
+            lastTickSec = currentSec;
+          }
+        }, 50);
+      }
+
+      // Events handlers
+      startBtn.addEventListener("click", startTimer);
+
+      // Reset to 0 by tapping anywhere while the timer is running
+      tapOverlay.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (isRunning) {
+          stopTimer();
+          resetToZero();
+        }
+      });
+
+      // Service Worker registration for PWA
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("./sw.js")
+            .then((reg) => console.log("Service Worker was registered!", reg))
+            .catch((err) => console.error("Regisrtation error of SW:", err));
+        });
+      }
+    </script>
+  </body>
+</html>
